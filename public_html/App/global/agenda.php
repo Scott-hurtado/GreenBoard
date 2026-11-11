@@ -1,0 +1,1317 @@
+<?php
+/* ════════════════════════════════════════════════════════════════
+   global/agenda.php — Agenda Unificada 5 niveles
+   Nivel 1 (Admin):      todos los estados, filtros completos
+   Nivel 2 (Circ):       estados de su circ, filtros estado→región→zona→sección
+   Nivel 3 (Estatal):    su estado fijo, filtros región→zona→municipio→sección
+   Nivel 4 (Regional):   sus municipios/zonas, filtro zona→municipio
+   Nivel 5 (Zona):       sus secciones, filtro municipio
+════════════════════════════════════════════════════════════════ */
+
+if (file_exists(__DIR__ . '/../../includes/bootstrap.php')) {
+    require_once __DIR__ . '/../../includes/bootstrap.php';
+} else { session_start(); }
+
+$rol_sesion  = strtolower($_SESSION['user_role']          ?? '');
+$user_id     = $_SESSION['user_id']                       ?? 0;
+$user_circ   = $_SESSION['user_circunscripcion']          ?? '';
+$user_estado = trim($_SESSION['user_estado']              ?? '');
+$user_region = $_SESSION['user_region']                   ?? '';
+$user_zona   = $_SESSION['user_zona_nombre']              ?? '';
+
+$jerarquia = [
+    'admin'=>1,'administrador'=>1,'superadmin'=>1,'super admin'=>1,
+    'coordinadores_circunscripcion'=>2,'coordinador_circunscripcion'=>2,'circunscripcion'=>2,
+    'coordinador_estatal'=>3,
+    'coordinador_regional'=>4,'regional'=>4,
+    'coordinador_zona'=>5,
+];
+$mi_nivel = $jerarquia[$rol_sesion] ?? 6;
+
+$permitidos = array_keys($jerarquia);
+if (!in_array($rol_sesion, $permitidos)) { header('Location: /public/index.php'); exit(); }
+
+// ── Circunscripciones ─────────────────────────────────────
+$CIRCS = [
+    'Circunscripción 1' => ['Baja California','Baja California Sur','Chihuahua','Durango','Jalisco','Nayarit','Sinaloa','Sonora'],
+    'Circunscripción 2' => ['Aguascalientes','Coahuila','Guanajuato','Nuevo Leon','San Luis Potosi','Tamaulipas','Zacatecas'],
+    'Circunscripción 3' => ['Campeche','Chiapas','Oaxaca','Quintana Roo','Tabasco','Veracruz','Yucatan'],
+    'Circunscripción 4' => ['Ciudad de Mexico','Guerrero','Hidalgo','Morelos','Puebla','Tlaxcala'],
+    'Circunscripción 5' => ['Colima','Estado de Mexico','Michoacan','Queretaro'],
+];
+$estados_circ = ($mi_nivel === 2) ? ($CIRCS[$user_circ] ?? []) : [];
+
+// ── Conexión ──────────────────────────────────────────────
+$geo_data          = [];   // [clave => ['label'=>nombre, 'municipios'=>[...]]] para niveles 1-3
+$regiones_data     = [];   // {estado_nombre => [{id, nombre, zonas:[{id,nombre}]}]}
+$secciones_geo     = [];   // {estado => {municipio => [secciones]}} para niveles 1-3
+$municipios_region = [];   // nivel 4: municipios de la región
+$zonas_region      = [];   // nivel 4: zonas de la región [{id,nombre}]
+$region_nombre     = '—';
+$estados_disponibles = []; // labels para el filtro de estado
+
+try {
+    $dbCfg = __DIR__ . '/../../includes/database.php';
+    $cfg   = file_exists($dbCfg) ? require $dbCfg : [];
+    $dsn   = "mysql:host={$cfg['host']};dbname={$cfg['database']};charset=utf8mb4";
+    $pdo   = new PDO($dsn, $cfg['username'], $cfg['password'],
+                 [PDO::ATTR_ERRMODE=>PDO::ERRMODE_EXCEPTION, PDO::ATTR_DEFAULT_FETCH_MODE=>PDO::FETCH_ASSOC]);
+
+    /* ── Niveles 1-3: cargar GEO completo ── */
+    if ($mi_nivel <= 3) {
+        // Nivel 3: obtener estado desde BD
+        if ($mi_nivel === 3) {
+            $st = $pdo->prepare("SELECT estado FROM coordinador_estatal WHERE id=? LIMIT 1");
+            $st->execute([$user_id]);
+            $user_estado = trim($st->fetchColumn() ?: $user_estado);
+        }
+
+        // Estados y municipios
+        $stmt_est = $pdo->query("SELECT id, clave, nombre FROM estados ORDER BY nombre ASC");
+        $estados_db = $stmt_est->fetchAll();
+        if ($estados_db) {
+            $ids = array_column($estados_db, 'id');
+            $ph  = implode(',', array_fill(0, count($ids), '?'));
+            $stmt_mun = $pdo->prepare("SELECT estado_id, nombre FROM municipios WHERE estado_id IN ($ph) ORDER BY nombre ASC");
+            $stmt_mun->execute($ids);
+            $munis_by_estado = [];
+            foreach ($stmt_mun->fetchAll() as $m) $munis_by_estado[$m['estado_id']][] = $m['nombre'];
+            foreach ($estados_db as $e) {
+                // Filtrar por scope
+                if ($mi_nivel === 2 && !empty($estados_circ) && !in_array($e['nombre'], $estados_circ)) continue;
+                if ($mi_nivel === 3 && $e['nombre'] !== $user_estado) continue;
+                $geo_data[$e['clave']] = [
+                    'label'      => $e['nombre'],
+                    'municipios' => $munis_by_estado[$e['id']] ?? [],
+                ];
+            }
+        }
+
+        // Estados disponibles para el filtro
+        $estados_disponibles = array_values(array_map(fn($v) => $v['label'], $geo_data));
+        sort($estados_disponibles);
+
+        // Regiones agrupadas por estado para el modal
+        if (!empty($estados_disponibles)) {
+            $ph2 = implode(',', array_fill(0, count($estados_disponibles), '?'));
+            $stmt_reg = $pdo->prepare("
+                SELECT r.id, r.estado, r.nombre AS region_nombre,
+                       z.id AS zona_id, z.nombre AS zona_nombre
+                FROM regiones_estatales r
+                LEFT JOIN zonas_estatales z ON z.estructura_id = r.id
+                WHERE r.estado IN ($ph2)
+                ORDER BY r.estado ASC, r.nombre ASC, z.nombre ASC
+            ");
+            $stmt_reg->execute($estados_disponibles);
+            foreach ($stmt_reg->fetchAll() as $row) {
+                $est = $row['estado']; $rid = (int)$row['id'];
+                if (!isset($regiones_data[$est])) $regiones_data[$est] = [];
+                $found = false;
+                foreach ($regiones_data[$est] as &$reg) {
+                    if ($reg['id'] === $rid) {
+                        if ($row['zona_id']) $reg['zonas'][] = ['id'=>(int)$row['zona_id'],'nombre'=>$row['zona_nombre']];
+                        $found = true; break;
+                    }
+                }
+                unset($reg);
+                if (!$found) {
+                    $regiones_data[$est][] = [
+                        'id'=>$rid,'nombre'=>$row['region_nombre'],
+                        'zonas'=>$row['zona_id']?[['id'=>(int)$row['zona_id'],'nombre'=>$row['zona_nombre']]]:[]
+                    ];
+                }
+            }
+        }
+
+        // Secciones por estado+municipio
+        $scope_estados = $mi_nivel === 3 ? [$user_estado] : $estados_disponibles;
+        if (!empty($scope_estados)) {
+            $ph3 = implode(',', array_fill(0, count($scope_estados), '?'));
+            $stmt_sec = $pdo->prepare("
+                SELECT sec.estado_nombre, m.nombre AS municipio_nombre, sec.seccion
+                FROM secciones sec LEFT JOIN municipios m ON m.id=sec.municipio_id
+                WHERE sec.estado_nombre IN ($ph3)
+                ORDER BY sec.estado_nombre ASC, m.nombre ASC, CAST(sec.seccion AS UNSIGNED) ASC
+            ");
+            $stmt_sec->execute($scope_estados);
+            foreach ($stmt_sec->fetchAll() as $row) {
+                if ($row['estado_nombre'] && $row['municipio_nombre'])
+                    $secciones_geo[$row['estado_nombre']][$row['municipio_nombre']][] = $row['seccion'];
+            }
+        }
+
+    /* ── Nivel 4: Regional ── */
+    } elseif ($mi_nivel === 4) {
+        if ($user_region) {
+            $st = $pdo->prepare("SELECT nombre FROM geo_regiones WHERE id=? LIMIT 1");
+            $st->execute([$user_region]); $r = $st->fetch();
+            if ($r) $region_nombre = ucfirst($r['nombre']);
+            $st = $pdo->prepare("SELECT municipio FROM region_municipios WHERE region_id=?");
+            $st->execute([$user_region]); $municipios_region = $st->fetchAll(PDO::FETCH_COLUMN);
+            $st = $pdo->prepare("SELECT id, nombre FROM geo_zonas WHERE region_id=? ORDER BY nombre");
+            $st->execute([$user_region]); $zonas_region = $st->fetchAll();
+        }
+        // Secciones por municipio para el modal
+        if ($municipios_region) {
+            $ph4 = implode(',', array_fill(0, count($municipios_region), '?'));
+            $stmt_sec = $pdo->prepare("
+                SELECT m.nombre AS municipio_nombre, sec.seccion
+                FROM secciones sec LEFT JOIN municipios m ON m.id=sec.municipio_id
+                WHERE m.nombre IN ($ph4)
+                ORDER BY m.nombre ASC, CAST(sec.seccion AS UNSIGNED) ASC
+            ");
+            $stmt_sec->execute($municipios_region);
+            foreach ($stmt_sec->fetchAll() as $row) {
+                $mun = $row['municipio_nombre'] ?? '';
+                if ($mun) $secciones_geo[$mun][] = $row['seccion'];
+            }
+        }
+
+    /* ── Nivel 5: Zona ── */
+    } elseif ($mi_nivel === 5) {
+        // Municipios disponibles para el filtro (del estado, filtrando a la zona)
+        $st = $pdo->prepare("
+            SELECT DISTINCT municipio FROM secciones_electorales
+            WHERE TRIM(zona_asignada)=TRIM(?) AND activo=1 ORDER BY municipio
+        ");
+        $st->execute([$user_zona]);
+        $municipios_region = $st->fetchAll(PDO::FETCH_COLUMN);
+        // Secciones por municipio
+        $st = $pdo->prepare("
+            SELECT nombre_seccion AS seccion, municipio FROM secciones_electorales
+            WHERE TRIM(zona_asignada)=TRIM(?) AND activo=1
+            ORDER BY municipio ASC, CAST(nombre_seccion AS UNSIGNED) ASC
+        ");
+        $st->execute([$user_zona]);
+        foreach ($st->fetchAll() as $row) {
+            $mun = $row['municipio'] ?? '';
+            if ($mun) $secciones_geo[$mun][] = $row['seccion'];
+        }
+    }
+
+} catch (PDOException $e) { $error_db = $e->getMessage(); }
+
+// ── Config por nivel para el template ────────────────────
+$scope_label = match($mi_nivel) {
+    1 => 'ADMINISTRADOR',
+    2 => strtoupper($user_circ),
+    3 => strtoupper($user_estado),
+    4 => 'REGIÓN '.strtoupper($region_nombre),
+    5 => strtoupper($user_zona),
+    default => 'AGENDA'
+};
+?>
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Agenda — Proyecto Verde</title>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+    <style>
+    :root {
+        --primary:#2d7a3e; --primary-dark:#1f5a2d; --primary-light:rgba(45,122,62,0.08);
+        --dark:#1a1a1a; --light:#f0f7f0; --white:#ffffff;
+        --gray-50:#f9fafb; --gray-100:#f3f4f6; --gray-200:#e5e7eb; --gray-300:#d1d5db;
+        --text:#111827; --text-muted:#6b7280; --text-light:#9ca3af;
+        --voto:#2d7a3e; --voto-bg:rgba(45,122,62,0.12);
+        --comunicacion:#1a73e8; --comunicacion-bg:rgba(26,115,232,0.12);
+        --organizacion:#8b00d4; --organizacion-bg:rgba(139,0,212,0.12);
+        --shadow:0 1px 3px rgba(0,0,0,0.1); --shadow-lg:0 10px 25px rgba(0,0,0,0.1);
+        --sidebar-w:280px;
+    }
+    *{margin:0;padding:0;box-sizing:border-box;}
+    body{font-family:'Google Sans','Segoe UI',Arial,sans-serif;background:var(--white);color:var(--text);height:100vh;display:flex;flex-direction:column;overflow:hidden;padding-left:var(--sidebar-w);}
+    /* ── TOP BAR ── */
+    .topbar{height:64px;border-bottom:1px solid var(--gray-200);display:flex;align-items:center;justify-content:space-between;padding:0 24px;flex-shrink:0;background:var(--white);position:sticky;top:0;z-index:100;}
+    .topbar-left{display:flex;align-items:center;gap:16px;}
+    .topbar-title{font-size:22px;font-weight:400;color:var(--text);letter-spacing:-0.3px;}
+    .topbar-nav{display:flex;align-items:center;gap:4px;}
+    .nav-btn{width:36px;height:36px;border-radius:50%;border:none;background:transparent;cursor:pointer;font-size:16px;color:var(--text-muted);display:flex;align-items:center;justify-content:center;transition:background 0.15s;}
+    .nav-btn:hover{background:var(--gray-100);}
+    .today-btn{padding:0 14px;height:36px;border-radius:18px;border:1px solid var(--gray-300);background:var(--white);font-size:13px;font-weight:600;color:var(--text);cursor:pointer;transition:background 0.15s;white-space:nowrap;}
+    .today-btn:hover{background:var(--gray-50);}
+    .scope-badge{background:rgba(45,122,62,0.1);color:var(--primary);font-size:11px;font-weight:700;padding:4px 12px;border-radius:20px;letter-spacing:1px;}
+    .view-switcher{display:flex;border:1px solid var(--gray-200);border-radius:8px;overflow:hidden;}
+    .view-btn{padding:7px 14px;font-size:12px;font-weight:600;border:none;cursor:pointer;transition:all 0.15s;background:var(--white);color:var(--text-muted);}
+    .view-btn.active{background:var(--primary);color:white;}
+    .view-btn:not(:last-child){border-right:1px solid var(--gray-200);}
+    .new-event-btn{display:flex;align-items:center;gap:8px;background:var(--primary);color:white;border:none;padding:10px 20px;border-radius:24px;font-size:14px;font-weight:600;cursor:pointer;box-shadow:0 1px 3px rgba(45,122,62,0.4);transition:all 0.2s;}
+    .new-event-btn:hover{background:var(--primary-dark);box-shadow:0 4px 12px rgba(45,122,62,0.35);}
+    /* ── FILTER BAR ── */
+    .filter-bar{display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:10px 24px;border-bottom:1px solid var(--gray-200);background:var(--gray-50);flex-shrink:0;}
+    .filter-label{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.5px;color:var(--text-muted);white-space:nowrap;margin-right:2px;}
+    .filter-select{height:32px;padding:0 28px 0 10px;border-radius:8px;border:1.5px solid var(--gray-200);background:var(--white);font-size:12px;font-weight:600;color:var(--text);outline:none;cursor:pointer;appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%236b7280'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 8px center;transition:border-color 0.15s;min-width:130px;}
+    .filter-select:focus{border-color:var(--primary);}
+    .filter-select.active{border-color:var(--primary);background-color:rgba(45,122,62,0.06);color:var(--primary);}
+    .filter-sep{width:1px;height:22px;background:var(--gray-200);margin:0 4px;flex-shrink:0;}
+    .filter-chip{display:inline-flex;align-items:center;gap:5px;height:32px;padding:0 12px;border-radius:16px;border:1.5px solid var(--gray-200);background:var(--white);font-size:11px;font-weight:700;cursor:pointer;transition:all 0.15s;color:var(--text-muted);white-space:nowrap;}
+    .filter-chip:hover{border-color:var(--gray-400);color:var(--text);}
+    .filter-chip.active-voto{background:var(--voto-bg);border-color:var(--voto);color:var(--voto);}
+    .filter-chip.active-comunicacion{background:var(--comunicacion-bg);border-color:var(--comunicacion);color:var(--comunicacion);}
+    .filter-chip.active-organizacion{background:var(--organizacion-bg);border-color:var(--organizacion);color:var(--organizacion);}
+    .filter-reset{height:32px;padding:0 14px;border-radius:8px;border:none;background:transparent;color:var(--text-muted);font-size:12px;font-weight:600;cursor:pointer;display:flex;align-items:center;gap:5px;transition:all 0.15s;}
+    .filter-reset:hover{background:var(--gray-200);color:var(--text);}
+    .filter-count{font-size:11px;font-weight:700;color:var(--primary);background:rgba(45,122,62,0.1);padding:3px 10px;border-radius:12px;white-space:nowrap;flex-shrink:0;}
+    /* ── BODY: mini sidebar + main ── */
+    .cal-body{display:flex;flex:1;overflow:hidden;}
+    /* ── MINI SIDEBAR ── */
+    .mini-sidebar{width:256px;flex-shrink:0;padding:16px;border-right:1px solid var(--gray-200);overflow-y:auto;display:flex;flex-direction:column;gap:20px;}
+    .mini-cal-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;}
+    .mini-cal-title{font-size:13px;font-weight:600;color:var(--text);}
+    .mini-nav{width:28px;height:28px;border-radius:50%;border:none;background:transparent;cursor:pointer;font-size:13px;color:var(--text-muted);display:flex;align-items:center;justify-content:center;transition:background 0.15s;}
+    .mini-nav:hover{background:var(--gray-100);}
+    .mini-grid{display:grid;grid-template-columns:repeat(7,1fr);gap:2px;}
+    .mini-dow{font-size:10px;font-weight:700;text-transform:uppercase;color:var(--text-light);text-align:center;padding:4px 0;}
+    .mini-day{width:28px;height:28px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:500;color:var(--text);cursor:pointer;margin:0 auto;transition:background 0.12s;}
+    .mini-day:hover{background:var(--gray-100);}
+    .mini-day.other-month{color:var(--text-light);}
+    .mini-day.today{background:var(--primary);color:white;font-weight:700;}
+    .mini-day.selected{background:var(--primary-light);color:var(--primary);font-weight:700;}
+    /* Balance */
+    .balance-box{background:var(--gray-50);border-radius:12px;padding:14px;}
+    .balance-box-title{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.5px;color:var(--text-muted);margin-bottom:12px;}
+    .bal-row{margin-bottom:10px;}
+    .bal-label{display:flex;justify-content:space-between;font-size:11px;margin-bottom:4px;}
+    .bal-name{color:var(--text-muted);font-weight:500;}
+    .bal-pct{font-weight:700;}
+    .bal-track{height:4px;border-radius:2px;background:var(--gray-200);overflow:hidden;}
+    .bal-fill{height:100%;border-radius:2px;transition:width 0.6s ease;}
+    .badge-bal{display:inline-flex;align-items:center;gap:5px;font-size:10px;font-weight:700;padding:3px 9px;border-radius:12px;margin-top:8px;}
+    .badge-bal.ok{background:rgba(45,122,62,0.12);color:var(--primary);}
+    .badge-bal.bad{background:#fff7ed;color:#d97706;}
+    /* Upcoming */
+    .upcoming-title{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.5px;color:var(--text-muted);margin-bottom:10px;}
+    .upcoming-item{display:flex;gap:10px;align-items:flex-start;padding:8px 0;border-bottom:1px solid var(--gray-100);cursor:pointer;}
+    .upcoming-item:last-child{border-bottom:none;}
+    .upcoming-dot{width:10px;height:10px;border-radius:50%;flex-shrink:0;margin-top:3px;}
+    .upcoming-ev-title{font-size:12px;font-weight:600;color:var(--text);line-height:1.3;}
+    .upcoming-ev-date{font-size:10px;color:var(--text-muted);margin-top:2px;}
+    /* ── MAIN CAL ── */
+    .cal-main{flex:1;display:flex;flex-direction:column;overflow:hidden;}
+    .month-view{flex:1;display:flex;flex-direction:column;overflow:hidden;}
+    .month-dow-row{display:grid;grid-template-columns:repeat(7,1fr);border-bottom:1px solid var(--gray-200);flex-shrink:0;}
+    .month-dow{padding:10px 8px;font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.5px;color:var(--text-muted);text-align:center;}
+    .month-grid{flex:1;display:grid;grid-template-columns:repeat(7,1fr);grid-auto-rows:1fr;overflow:hidden;}
+    .month-cell{border-right:1px solid var(--gray-200);border-bottom:1px solid var(--gray-200);padding:6px 8px;overflow:hidden;cursor:pointer;transition:background 0.12s;min-height:100px;display:flex;flex-direction:column;}
+    .month-cell:hover{background:var(--gray-50);}
+    .month-cell.other-month{background:var(--gray-50);}
+    .month-cell.other-month .cell-num{color:var(--text-light);}
+    .month-cell.today{background:#e8f5e9;}
+    .cell-num{font-size:13px;font-weight:500;color:var(--text);width:28px;height:28px;border-radius:50%;display:flex;align-items:center;justify-content:center;flex-shrink:0;margin-bottom:4px;}
+    .month-cell.today .cell-num{background:var(--primary);color:white;font-weight:700;}
+    .cell-events{display:flex;flex-direction:column;gap:2px;flex:1;overflow:hidden;}
+    .cell-pill{font-size:11px;font-weight:600;padding:2px 7px;border-radius:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;cursor:pointer;transition:filter 0.1s;display:block;}
+    .cell-pill:hover{filter:brightness(0.92);}
+    .cell-pill.voto{background:var(--voto-bg);color:var(--voto);}
+    .cell-pill.comunicacion{background:var(--comunicacion-bg);color:var(--comunicacion);}
+    .cell-pill.organizacion{background:var(--organizacion-bg);color:var(--organizacion);}
+    .cell-more{font-size:10px;font-weight:700;color:var(--text-muted);padding:2px 4px;cursor:pointer;}
+    /* Week view */
+    .week-view{flex:1;display:flex;flex-direction:column;overflow:hidden;}
+    .week-header-row{display:grid;grid-template-columns:52px repeat(7,1fr);border-bottom:1px solid var(--gray-200);flex-shrink:0;}
+    .week-header-time{padding:8px;}
+    .week-header-day{padding:10px 8px;text-align:center;border-left:1px solid var(--gray-200);}
+    .whd-dow{font-size:11px;font-weight:700;text-transform:uppercase;color:var(--text-muted);}
+    .whd-num{font-size:24px;font-weight:400;color:var(--text);line-height:1.1;margin-top:2px;}
+    .week-header-day.today .whd-num{background:var(--primary);color:white;width:40px;height:40px;border-radius:50%;display:inline-flex;align-items:center;justify-content:center;font-weight:700;font-size:20px;}
+    .week-body{flex:1;overflow-y:auto;display:grid;grid-template-columns:52px repeat(7,1fr);}
+    .week-time-col{display:flex;flex-direction:column;}
+    .week-time-slot{height:48px;flex-shrink:0;display:flex;align-items:flex-start;justify-content:flex-end;padding:0 8px;padding-top:2px;font-size:10px;font-weight:500;color:var(--text-light);}
+    .week-day-col{border-left:1px solid var(--gray-200);display:flex;flex-direction:column;position:relative;}
+    .week-day-col.today{background:rgba(45,122,62,0.02);}
+    .week-hour-row{height:48px;flex-shrink:0;border-bottom:1px solid var(--gray-100);position:relative;}
+    .week-hour-row:hover{background:rgba(45,122,62,0.04);}
+    .week-event{position:absolute;left:2px;right:2px;border-radius:4px;padding:2px 6px;font-size:11px;font-weight:600;cursor:pointer;z-index:1;overflow:hidden;transition:filter 0.1s;}
+    .week-event:hover{filter:brightness(0.92);}
+    .week-event.voto{background:var(--voto-bg);color:var(--voto);border-left:3px solid var(--voto);}
+    .week-event.comunicacion{background:var(--comunicacion-bg);color:var(--comunicacion);border-left:3px solid var(--comunicacion);}
+    .week-event.organizacion{background:var(--organizacion-bg);color:var(--organizacion);border-left:3px solid var(--organizacion);}
+    .week-allday-row{display:grid;grid-template-columns:52px repeat(7,1fr);border-bottom:1px solid var(--gray-200);flex-shrink:0;min-height:28px;}
+    .week-allday-label{font-size:10px;color:var(--text-light);padding:4px 8px;text-align:right;}
+    .week-allday-cell{border-left:1px solid var(--gray-200);padding:2px 3px;display:flex;flex-direction:column;gap:2px;}
+    /* Popover */
+    .ev-popover{position:fixed;z-index:9000;background:var(--white);border-radius:12px;box-shadow:0 8px 30px rgba(0,0,0,0.18);border:1px solid var(--gray-200);width:300px;padding:0;overflow:hidden;animation:popIn 0.15s ease;}
+    @keyframes popIn{from{opacity:0;transform:scale(0.95)}to{opacity:1;transform:scale(1)}}
+    .popover-bar{height:6px;}
+    .popover-body{padding:16px 20px 20px;}
+    .popover-title{font-size:16px;font-weight:700;color:var(--text);margin-bottom:8px;line-height:1.3;}
+    .popover-badge{display:inline-flex;align-items:center;gap:5px;font-size:11px;font-weight:700;padding:3px 10px;border-radius:12px;margin-bottom:12px;}
+    .popover-row{display:flex;align-items:flex-start;gap:10px;margin-bottom:8px;font-size:13px;color:var(--text-muted);}
+    .popover-row i{width:16px;flex-shrink:0;margin-top:2px;}
+    .popover-row span{color:var(--text);}
+    .popover-actions{display:flex;justify-content:flex-end;gap:8px;padding-top:12px;border-top:1px solid var(--gray-100);margin-top:4px;}
+    .pop-btn{font-size:12px;font-weight:600;padding:6px 14px;border-radius:8px;border:none;cursor:pointer;transition:background 0.15s;}
+    .pop-btn-edit{background:var(--primary);color:white;}
+    .pop-btn-edit:hover{background:var(--primary-dark);}
+    .pop-btn-del{background:#fef2f2;color:#dc2626;}
+    .pop-btn-del:hover{background:#fee2e2;}
+    .pop-close{position:absolute;top:10px;right:10px;width:28px;height:28px;border-radius:50%;border:none;background:transparent;cursor:pointer;font-size:14px;color:var(--text-muted);display:flex;align-items:center;justify-content:center;}
+    .pop-close:hover{background:var(--gray-100);}
+    /* Modal */
+    .modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,0.35);z-index:5000;align-items:center;justify-content:center;opacity:0;transition:opacity 0.2s;}
+    .modal-overlay.open{display:flex;opacity:1;}
+    .modal-box{background:var(--white);border-radius:20px;box-shadow:0 25px 50px rgba(0,0,0,0.25);width:90%;max-width:620px;padding:36px;position:relative;transform:translateY(20px);opacity:0;transition:all 0.3s ease;max-height:90vh;overflow-y:auto;}
+    .modal-overlay.open .modal-box{transform:translateY(0);opacity:1;}
+    .modal-box-title{font-size:22px;font-weight:700;margin-bottom:4px;color:var(--text);}
+    .modal-box-sub{font-size:13px;color:var(--text-muted);margin-bottom:24px;}
+    .mclose{position:absolute;top:20px;right:20px;width:36px;height:36px;border-radius:50%;border:none;background:var(--gray-100);cursor:pointer;font-size:16px;color:var(--text-muted);display:flex;align-items:center;justify-content:center;transition:all 0.2s;}
+    .mclose:hover{background:var(--gray-200);transform:rotate(90deg);}
+    .fg{display:flex;flex-direction:column;gap:6px;margin-bottom:18px;}
+    .flabel{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.5px;color:var(--text-muted);}
+    .finput{width:100%;padding:11px 14px;border-radius:10px;border:1.5px solid var(--gray-200);background:var(--gray-50);font-size:14px;font-weight:500;color:var(--text);outline:none;transition:all 0.2s;font-family:inherit;appearance:none;}
+    .finput:focus{border-color:var(--primary);background:var(--white);}
+    textarea.finput{resize:vertical;min-height:80px;font-weight:400;}
+    .eje-row{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;}
+    .eje-pill{padding:10px 8px;border-radius:10px;border:2px solid var(--gray-200);font-size:11px;font-weight:700;text-align:center;cursor:pointer;background:var(--gray-50);color:var(--text-muted);transition:all 0.15s;}
+    .eje-pill.sel-voto{background:var(--voto-bg);border-color:var(--voto);color:var(--voto);}
+    .eje-pill.sel-comunicacion{background:var(--comunicacion-bg);border-color:var(--comunicacion);color:var(--comunicacion);}
+    .eje-pill.sel-organizacion{background:var(--organizacion-bg);border-color:var(--organizacion);color:var(--organizacion);}
+    .form-grid-2{display:grid;grid-template-columns:1fr 1fr;gap:14px;}
+    .form-grid-3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px;}
+    .mfooter{display:flex;justify-content:space-between;align-items:center;margin-top:24px;padding-top:20px;border-top:1px solid var(--gray-200);}
+    .mbtn{padding:11px 24px;border-radius:12px;font-size:14px;font-weight:600;cursor:pointer;border:none;transition:all 0.2s;font-family:inherit;}
+    .mbtn-save{background:var(--primary);color:white;box-shadow:0 2px 8px rgba(45,122,62,0.3);}
+    .mbtn-save:hover{background:var(--primary-dark);}
+    .mbtn-cancel{background:var(--white);color:var(--text-muted);border:1px solid var(--gray-200);}
+    .mbtn-cancel:hover{border-color:var(--gray-400);color:var(--text);}
+    .mbtn-del{background:#fef2f2;color:#dc2626;border:1px solid #fecaca;}
+    .mbtn-del:hover{background:#fee2e2;}
+    /* Sección dropdown */
+    .sec-agenda-wrap{position:relative;width:100%;}
+    .sec-agenda-input{cursor:pointer!important;padding-right:32px!important;}
+    .sec-agenda-arrow{position:absolute;right:12px;top:50%;transform:translateY(-50%);pointer-events:none;color:var(--text-muted);font-size:11px;transition:transform 0.2s;}
+    .sec-agenda-wrap.open .sec-agenda-arrow{transform:translateY(-50%) rotate(180deg);}
+    .sec-agenda-list{display:none;position:absolute;top:calc(100% + 4px);left:0;right:0;background:var(--white);border:2px solid var(--primary);border-radius:10px;z-index:9999;max-height:220px;overflow:hidden;box-shadow:0 8px 24px rgba(0,0,0,0.12);flex-direction:column;}
+    .sec-agenda-wrap.open .sec-agenda-list{display:flex;}
+    .sec-agenda-search{padding:10px 12px;border:none;border-bottom:1px solid var(--gray-200);font-size:13px;outline:none;font-family:inherit;color:var(--text);background:var(--gray-50);flex-shrink:0;}
+    .sec-agenda-search:focus{background:var(--white);}
+    .sec-agenda-options{overflow-y:auto;flex:1;}
+    .sec-agenda-opt{padding:9px 14px;font-size:13px;font-weight:600;cursor:pointer;color:var(--text);transition:background 0.12s;font-family:inherit;border-bottom:1px solid var(--gray-100);}
+    .sec-agenda-opt:last-child{border-bottom:none;}
+    .sec-agenda-opt:hover,.sec-agenda-opt.focused{background:var(--primary-light);color:var(--primary);}
+    .sec-agenda-opt.selected{background:var(--primary-light);color:var(--primary);font-weight:700;}
+    .sec-agenda-opt em{font-style:normal;font-weight:700;color:var(--primary);}
+    .sec-agenda-empty,.sec-agenda-loading{padding:14px;text-align:center;font-size:13px;color:var(--text-muted);font-style:italic;}
+    @media(max-width:900px){body{padding-left:0;}.mini-sidebar{display:none;}.topbar-title{font-size:16px;}}
+    </style>
+</head>
+<body>
+<?php
+$path_sb = __DIR__ . '/../../includes/components/';
+if      ($mi_nivel === 1) @include $path_sb . 'sidebar_admin.php';
+elseif  ($mi_nivel === 2) @include $path_sb . 'sidebar_circunscripcion.php';
+elseif  ($mi_nivel === 3) @include $path_sb . 'sidebar_ce.php';
+elseif  ($mi_nivel === 4) @include $path_sb . 'sidebar_regional.php';
+elseif  ($mi_nivel === 5) @include $path_sb . 'sidebar_cz.php';
+?>
+
+<!-- TOP BAR -->
+<div class="topbar">
+    <div class="topbar-left">
+        <button class="today-btn" onclick="irHoy()">Hoy</button>
+        <div class="topbar-nav">
+            <button class="nav-btn" onclick="navegar(-1)"><i class="fas fa-chevron-left"></i></button>
+            <button class="nav-btn" onclick="navegar(1)"><i class="fas fa-chevron-right"></i></button>
+        </div>
+        <span class="topbar-title" id="topbar-label">—</span>
+    </div>
+    <div style="display:flex;align-items:center;gap:12px;">
+        <span class="scope-badge"><?php echo htmlspecialchars($scope_label); ?></span>
+        <div class="view-switcher">
+            <button class="view-btn" id="vbtn-month" onclick="setVista('month')">Mes</button>
+            <button class="view-btn active" id="vbtn-week" onclick="setVista('week')">Semana</button>
+        </div>
+        <button class="new-event-btn" onclick="abrirModal()">
+            <i class="fas fa-plus"></i> Nuevo Evento
+        </button>
+    </div>
+</div>
+
+<!-- FILTER BAR — diferente por nivel -->
+<div class="filter-bar" id="filter-bar">
+    <span class="filter-label"><i class="fas fa-filter" style="font-size:10px;"></i> Filtros:</span>
+
+    <!-- Eje chips — todos los niveles -->
+    <button class="filter-chip" id="fchip-voto"         onclick="toggleEjeFilter('voto')">&#128379; Voto</button>
+    <button class="filter-chip" id="fchip-comunicacion" onclick="toggleEjeFilter('comunicacion')">&#128226; Comunicaci&#243;n</button>
+    <button class="filter-chip" id="fchip-organizacion" onclick="toggleEjeFilter('organizacion')">&#9881;&#65039; Organizaci&#243;n</button>
+
+    <div class="filter-sep"></div>
+
+    <?php if ($mi_nivel <= 2): ?>
+    <!-- Admin / Circ: estado → región → zona → sección -->
+    <select class="filter-select" id="f-filter-estado" onchange="onFilterEstadoChange()">
+        <option value="">Todos los estados</option>
+        <?php foreach ($estados_disponibles as $e): ?>
+        <option value="<?php echo htmlspecialchars($e); ?>"><?php echo htmlspecialchars($e); ?></option>
+        <?php endforeach; ?>
+    </select>
+    <select class="filter-select" id="f-filter-region" onchange="onFilterRegionChange()" disabled>
+        <option value="">Todas las regiones</option>
+    </select>
+    <select class="filter-select" id="f-filter-zona" onchange="onFilterZonaChange()">
+        <option value="">Todas las zonas</option>
+    </select>
+    <select class="filter-select" id="f-filter-seccion">
+        <option value="">Todas las secciones</option>
+    </select>
+
+    <?php elseif ($mi_nivel === 3): ?>
+    <!-- Estatal: región → municipio -->
+    <select class="filter-select" id="f-filter-region" onchange="onFilterRegionChange()">
+        <option value="">Todas las regiones</option>
+        <?php foreach (($regiones_data[$user_estado] ?? []) as $reg): ?>
+        <option value="<?php echo htmlspecialchars($reg['nombre']); ?>"><?php echo htmlspecialchars($reg['nombre']); ?></option>
+        <?php endforeach; ?>
+    </select>
+    <select class="filter-select" id="f-filter-municipio" onchange="onFilterMunicipioChange()">
+        <option value="">Todos los municipios</option>
+    </select>
+
+    <?php elseif ($mi_nivel === 4): ?>
+    <!-- Regional: zona → municipio -->
+    <select class="filter-select" id="f-filter-zona" onchange="onFilterZonaChange()">
+        <option value="">Todas las zonas</option>
+        <?php foreach ($zonas_region as $z): ?>
+        <option value="<?php echo htmlspecialchars($z['nombre']); ?>"><?php echo htmlspecialchars($z['nombre']); ?></option>
+        <?php endforeach; ?>
+    </select>
+    <select class="filter-select" id="f-filter-municipio" onchange="onFilterMunicipioChange()">
+        <option value="">Todos los municipios</option>
+        <?php foreach (array_unique($municipios_region) as $m): ?>
+        <option value="<?php echo htmlspecialchars($m); ?>"><?php echo htmlspecialchars($m); ?></option>
+        <?php endforeach; ?>
+    </select>
+
+    <?php elseif ($mi_nivel === 5): ?>
+    <!-- Zona: municipio -->
+    <select class="filter-select" id="f-filter-municipio" onchange="onFilterMunicipioChange()">
+        <option value="">Todos los municipios</option>
+        <?php foreach ($municipios_region as $m): ?>
+        <option value="<?php echo htmlspecialchars($m); ?>"><?php echo htmlspecialchars($m); ?></option>
+        <?php endforeach; ?>
+    </select>
+    <?php endif; ?>
+
+    <div class="filter-sep"></div>
+    <button class="filter-reset" id="btn-reset-filters" onclick="resetFiltros()" style="display:none;">
+        <i class="fas fa-times-circle"></i> Limpiar
+    </button>
+    <span class="filter-count" id="filter-count" style="display:none;"></span>
+</div>
+
+<!-- BODY: mini sidebar + cal -->
+<div class="cal-body">
+    <aside class="mini-sidebar">
+        <div class="mini-cal">
+            <div class="mini-cal-header">
+                <span class="mini-cal-title" id="mini-cal-label">—</span>
+                <div style="display:flex;gap:2px;">
+                    <button class="mini-nav" onclick="miniNavegar(-1)"><i class="fas fa-chevron-left"></i></button>
+                    <button class="mini-nav" onclick="miniNavegar(1)"><i class="fas fa-chevron-right"></i></button>
+                </div>
+            </div>
+            <div class="mini-grid" id="mini-grid"></div>
+        </div>
+        <div class="balance-box">
+            <div class="balance-box-title" id="balance-title">Balance semanal</div>
+            <div class="bal-row">
+                <div class="bal-label"><span class="bal-name">Voto</span><span class="bal-pct" id="bpct-voto" style="color:var(--voto)">0%</span></div>
+                <div class="bal-track"><div class="bal-fill" id="bbar-voto" style="background:var(--voto);width:0%"></div></div>
+            </div>
+            <div class="bal-row">
+                <div class="bal-label"><span class="bal-name">Comunicación</span><span class="bal-pct" id="bpct-comunicacion" style="color:var(--comunicacion)">0%</span></div>
+                <div class="bal-track"><div class="bal-fill" id="bbar-comunicacion" style="background:var(--comunicacion);width:0%"></div></div>
+            </div>
+            <div class="bal-row">
+                <div class="bal-label"><span class="bal-name">Organización</span><span class="bal-pct" id="bpct-organizacion" style="color:var(--organizacion)">0%</span></div>
+                <div class="bal-track"><div class="bal-fill" id="bbar-organizacion" style="background:var(--organizacion);width:0%"></div></div>
+            </div>
+            <div id="badge-bal" class="badge-bal bad"><i class="fas fa-triangle-exclamation"></i> Desbalance</div>
+        </div>
+        <div class="upcoming-box">
+            <div class="upcoming-title">Próximos eventos</div>
+            <div id="upcoming-list"></div>
+        </div>
+    </aside>
+    <div class="cal-main" id="cal-main"></div>
+</div>
+
+<!-- POPOVER -->
+<div class="ev-popover" id="ev-popover" style="display:none;">
+    <button class="pop-close" onclick="cerrarPopover()"><i class="fas fa-times"></i></button>
+    <div class="popover-bar" id="pop-bar"></div>
+    <div class="popover-body">
+        <div class="popover-title" id="pop-title">—</div>
+        <div class="popover-badge" id="pop-badge"></div>
+        <div class="popover-row" id="pop-fecha"><i class="fas fa-calendar"></i><span></span></div>
+        <div class="popover-row" id="pop-hora"><i class="fas fa-clock"></i><span></span></div>
+        <div class="popover-row" id="pop-lugar"><i class="fas fa-map-marker-alt"></i><span></span></div>
+        <div class="popover-row" id="pop-resp"><i class="fas fa-user"></i><span></span></div>
+        <div class="popover-row" id="pop-notas"><i class="fas fa-align-left"></i><span></span></div>
+        <div class="popover-actions">
+            <button class="pop-btn pop-btn-del" id="pop-del">Eliminar</button>
+            <button class="pop-btn pop-btn-edit" id="pop-edit">Editar</button>
+        </div>
+    </div>
+</div>
+
+<!-- MODAL CREAR/EDITAR -->
+<div class="modal-overlay" id="modal-form" onclick="if(event.target===this)cerrarModal()">
+    <div class="modal-box">
+        <button class="mclose" onclick="cerrarModal()"><i class="fas fa-times"></i></button>
+        <h2 class="modal-box-title" id="modal-title">Nuevo Evento</h2>
+        <p class="modal-box-sub">Registra un evento en la agenda semanal inteligente.</p>
+
+        <div class="fg">
+            <label class="flabel">Eje *</label>
+            <div class="eje-row">
+                <button class="eje-pill" data-eje="voto"         onclick="selEje('voto')"         type="button">&#128379; Voto / Territorio</button>
+                <button class="eje-pill" data-eje="comunicacion" onclick="selEje('comunicacion')" type="button">&#128226; Comunicación</button>
+                <button class="eje-pill" data-eje="organizacion" onclick="selEje('organizacion')" type="button">&#9881;&#65039; Organización</button>
+            </div>
+        </div>
+        <div class="fg">
+            <label class="flabel">Subtipo</label>
+            <select id="f-subtipo" class="finput"><option value="">— Selecciona un eje primero —</option></select>
+        </div>
+        <div class="fg">
+            <label class="flabel">Título *</label>
+            <input type="text" id="f-titulo" class="finput" placeholder="Ej. Recorrido Colonia Pitic">
+        </div>
+        <div class="form-grid-3" style="margin-bottom:18px;">
+            <div class="fg" style="margin-bottom:0;">
+                <label class="flabel">Fecha *</label>
+                <input type="date" id="f-fecha" class="finput">
+            </div>
+            <?php if ($mi_nivel <= 2): ?>
+            <div class="fg" style="margin-bottom:0;">
+                <label class="flabel">Estado</label>
+                <select id="f-estado" class="finput" onchange="cargarRegionesModal(this.value)">
+                    <option value="">— Estado —</option>
+                    <?php foreach ($estados_disponibles as $e): ?>
+                    <option value="<?php echo htmlspecialchars($e); ?>"><?php echo htmlspecialchars($e); ?></option>
+                    <?php endforeach; ?>
+                </select>
+            </div>
+            <div class="fg" style="margin-bottom:0;">
+                <label class="flabel">Región</label>
+                <select id="f-region" class="finput" onchange="cargarMunicipiosDesdeRegion(this.value)" disabled>
+                    <option value="">— Región —</option>
+                </select>
+            </div>
+            <?php elseif ($mi_nivel === 3): ?>
+            <div class="fg" style="margin-bottom:0;">
+                <label class="flabel">Estado</label>
+                <input type="text" class="finput" value="<?php echo htmlspecialchars($user_estado); ?>" readonly style="background:var(--gray-100);">
+                <input type="hidden" id="f-estado" value="<?php echo htmlspecialchars($user_estado); ?>">
+            </div>
+            <div class="fg" style="margin-bottom:0;">
+                <label class="flabel">Región</label>
+                <select id="f-region" class="finput" onchange="cargarMunicipiosDesdeRegion(this.value)">
+                    <option value="">— Región —</option>
+                    <?php foreach (($regiones_data[$user_estado] ?? []) as $reg): ?>
+                    <option value="<?php echo htmlspecialchars($reg['id']); ?>"><?php echo htmlspecialchars($reg['nombre']); ?></option>
+                    <?php endforeach; ?>
+                </select>
+            </div>
+            <?php else: ?>
+            <div class="fg" style="margin-bottom:0;">
+                <label class="flabel">Estado</label>
+                <input type="text" class="finput" value="<?php echo htmlspecialchars($user_estado); ?>" readonly style="background:var(--gray-100);">
+                <input type="hidden" id="f-estado" value="<?php echo htmlspecialchars($user_estado); ?>">
+            </div>
+            <div class="fg" style="margin-bottom:0;"></div>
+            <?php endif; ?>
+        </div>
+        <div class="form-grid-3" style="margin-bottom:18px;">
+            <div class="fg" style="margin-bottom:0;">
+                <label class="flabel">Municipio</label>
+                <select id="f-municipio" class="finput" onchange="cargarSecciones(this.value)" <?php echo $mi_nivel >= 3 ? '' : 'disabled'; ?>>
+                    <option value="">— Municipio —</option>
+                    <?php if ($mi_nivel >= 4): foreach (array_unique($municipios_region) as $m): ?>
+                    <option value="<?php echo htmlspecialchars($m); ?>"><?php echo htmlspecialchars($m); ?></option>
+                    <?php endforeach; endif; ?>
+                </select>
+            </div>
+            <div class="fg" style="margin-bottom:0;">
+                <label class="flabel">Sección <span id="f-sec-contador" style="font-weight:400;color:var(--text-muted);margin-left:4px;font-size:10px;"></span></label>
+                <div class="sec-agenda-wrap" id="sec-agenda-wrap">
+                    <input type="hidden" id="f-seccion" value="">
+                    <input type="text" class="sec-agenda-input finput" id="sec-agenda-display"
+                           placeholder="— Selecciona municipio primero —"
+                           readonly onclick="secAgendaToggle()" autocomplete="off">
+                    <i class="fas fa-chevron-down sec-agenda-arrow"></i>
+                    <div class="sec-agenda-list" id="sec-agenda-list">
+                        <input type="text" class="sec-agenda-search" id="sec-agenda-search"
+                               placeholder="&#128269; Buscar sección…"
+                               oninput="secAgendaFiltrar(this.value)"
+                               onkeydown="secAgendaNavegar(event)">
+                        <div class="sec-agenda-options" id="sec-agenda-options">
+                            <div class="sec-agenda-empty">Selecciona municipio primero</div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div class="form-grid-3" style="margin-bottom:18px;">
+            <div class="fg" style="margin-bottom:0;">
+                <label class="flabel">Inicio</label>
+                <select id="f-inicio" class="finput" onchange="limpiarErrorFin()">
+                    <option value="">-- : --</option>
+                </select>
+            </div>
+            <div class="fg" style="margin-bottom:0;">
+                <label class="flabel">Fin</label>
+                <select id="f-fin" class="finput" onchange="calcHoras()">
+                    <option value="">-- : --</option>
+                </select>
+                <span id="hora-error-msg" style="display:none;font-size:11px;font-weight:700;color:#dc2626;margin-top:4px;">
+                    <i class="fas fa-exclamation-circle"></i> El fin debe ser posterior al inicio
+                </span>
+            </div>
+        </div>
+        <div class="form-grid-2" style="margin-bottom:18px;">
+            <div class="fg" style="margin-bottom:0;">
+                <label class="flabel">Responsable</label>
+                <input type="text" id="f-responsable" class="finput" placeholder="Nombre">
+            </div>
+        </div>
+        <div class="fg">
+            <label class="flabel">Notas</label>
+            <textarea id="f-notas" class="finput" placeholder="Observaciones…"></textarea>
+        </div>
+        <div class="mfooter">
+            <button class="mbtn mbtn-del" id="btn-del-ev" style="visibility:hidden">
+                <i class="fas fa-trash-alt"></i> Eliminar
+            </button>
+            <div style="display:flex;gap:10px;">
+                <button class="mbtn mbtn-cancel" onclick="cerrarModal()">Cancelar</button>
+                <button class="mbtn mbtn-save" id="btn-save-ev" onclick="guardarEvento()">
+                    <i class="fas fa-check"></i> Guardar
+                </button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+// ── Config desde PHP ──────────────────────────────────────
+const MI_NIVEL           = <?php echo $mi_nivel; ?>;
+const PROCESAR_URL       = '../../api/agenda/procesar.php';
+const ESTADOS_DISPONIBLES= <?php echo json_encode($estados_disponibles, JSON_UNESCAPED_UNICODE); ?>;
+const GEO_DATA           = <?php echo json_encode($geo_data,        JSON_UNESCAPED_UNICODE); ?>;
+const REGIONES_DATA      = <?php echo json_encode($regiones_data,   JSON_UNESCAPED_UNICODE); ?>;
+const SECCIONES_GEO      = <?php echo json_encode($secciones_geo,   JSON_UNESCAPED_UNICODE); ?>;
+const MUNICIPIOS_SCOPE   = <?php echo json_encode(array_values(array_unique($municipios_region)), JSON_UNESCAPED_UNICODE); ?>;
+const USER_ESTADO        = <?php echo json_encode($user_estado, JSON_UNESCAPED_UNICODE); ?>;
+const USER_ZONA          = <?php echo json_encode($user_zona,   JSON_UNESCAPED_UNICODE); ?>;
+
+const MESES       = ['Enero','Febrero','Marzo','Abril','Mayo','Junio','Julio','Agosto','Septiembre','Octubre','Noviembre','Diciembre'];
+const MESES_CORTO = ['ene','feb','mar','abr','may','jun','jul','ago','sep','oct','nov','dic'];
+const DIAS_SEMANA = ['DOM','LUN','MAR','MIÉ','JUE','VIE','SÁB'];
+const EJE_COLORS  = { voto:'#2d7a3e', comunicacion:'#1a73e8', organizacion:'#8b00d4' };
+const EJE_LABELS  = { voto:'🗳️ Voto / Territorio', comunicacion:'📣 Comunicación', organizacion:'⚙️ Organización' };
+const SUBTIPOS    = {
+    voto:         ['Casa por casa','Evento de campaña','Mitin','Brigada vecinal','Recorrido territorial','Firma de compromisos','Contacto directo'],
+    comunicacion: ['Entrevista de radio','Entrevista de TV','Rueda de prensa','Publicación redes sociales','Spot / grabación','Vocería','Evento mediático'],
+    organizacion: ['Reunión de estructura','Capacitación','Coordinación interna','Planeación estratégica','Logística','Revisión de presupuesto','Reunión de equipo']
+};
+
+const normalize = s => (s||'').normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase().trim();
+
+// ── Estado global ─────────────────────────────────────────
+let eventos    = [];
+let vista      = 'week';
+let hoy        = new Date(); hoy.setHours(0,0,0,0);
+let cursor     = new Date(hoy);
+let miniCursor = new Date(hoy);
+let editandoId = null;
+let ejeSeleccionado = null;
+let popoverEvId = null;
+let SEC_AGENDA  = [];
+let SEC_FOCUSED = -1;
+let filtros     = { ejes:[], estado:'', region:'', zona:'', municipio:'', seccion:'' };
+
+const fmtDate = d => `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
+const pad     = n => String(n).padStart(2,'0');
+const fmtHora = t => {
+    if (!t) return '';
+    const [h, m] = t.split(':').map(Number);
+    return `${h % 12 || 12}:${pad(m)} ${h >= 12 ? 'pm' : 'am'}`;
+};
+const getInicioSemana = d => {
+    const r = new Date(d); const dia = r.getDay();
+    r.setDate(r.getDate() - (dia === 0 ? 6 : dia - 1)); r.setHours(0,0,0,0); return r;
+};
+
+// ── Cargar eventos ────────────────────────────────────────
+async function cargarEventos() {
+    try {
+        const res  = await fetch(PROCESAR_URL + '?action=list');
+        const data = await res.json();
+        if (data.ok) {
+            eventos = data.eventos.map(e => ({...e, id: parseInt(e.id)}));
+            // Filtrar client-side según scope del usuario
+            if (MI_NIVEL === 4 && MUNICIPIOS_SCOPE.length > 0) {
+                eventos = eventos.filter(e => !e.municipio || MUNICIPIOS_SCOPE.includes(e.municipio));
+            } else if (MI_NIVEL === 5) {
+                eventos = eventos.filter(e => !e.municipio || MUNICIPIOS_SCOPE.includes(e.municipio));
+            } else if (ESTADOS_DISPONIBLES.length > 0) {
+                eventos = eventos.filter(e => !e.estado || ESTADOS_DISPONIBLES.includes(e.estado));
+            }
+        }
+    } catch(e) { console.error(e); }
+}
+
+// ── Filtrado activo ───────────────────────────────────────
+function eventosFiltrados() {
+    return eventos.filter(ev => {
+        if (filtros.ejes.length > 0 && !filtros.ejes.includes(ev.eje)) return false;
+        if (filtros.estado   && ev.estado    !== filtros.estado)   return false;
+        if (filtros.region   && ev.region    !== filtros.region)   return false;
+        if (filtros.municipio&& ev.municipio !== filtros.municipio)return false;
+        if (filtros.seccion  && String(ev.seccion) !== filtros.seccion) return false;
+        return true;
+    });
+}
+
+// ── Render principal ──────────────────────────────────────
+function render() {
+    if (vista === 'month') renderMes(); else renderSemana();
+    renderMiniCal(); renderBalance(); renderUpcoming();
+}
+
+// ── Vista Mes ─────────────────────────────────────────────
+function renderMes() {
+    const year=cursor.getFullYear(), month=cursor.getMonth();
+    document.getElementById('topbar-label').textContent=`${MESES[month]} ${year}`;
+    const primerDia=new Date(year,month,1);
+    const inicioGrid=new Date(primerDia);
+    const dow=primerDia.getDay();
+    inicioGrid.setDate(primerDia.getDate()-(dow===0?6:dow-1));
+    const dias=[]; const d=new Date(inicioGrid);
+    while(dias.length<42){dias.push(new Date(d));d.setDate(d.getDate()+1);}
+    const DOW=['LUN','MAR','MIÉ','JUE','VIE','SÁB','DOM'];
+    let html=`<div class="month-view"><div class="month-dow-row">${DOW.map(d=>`<div class="month-dow">${d}</div>`).join('')}</div><div class="month-grid">`;
+    dias.forEach(dia=>{
+        const fechaStr=fmtDate(dia), esHoy=fechaStr===fmtDate(hoy), otroMes=dia.getMonth()!==month;
+        const evsDia=eventosFiltrados().filter(e=>e.fecha===fechaStr).sort((a,b)=>(a.inicio||'').localeCompare(b.inicio||''));
+        const MAX=3, visible=evsDia.slice(0,MAX), extra=evsDia.length-MAX;
+        html+=`<div class="month-cell${esHoy?' today':''}${otroMes?' other-month':''}" onclick="cellClick('${fechaStr}',event)">
+          <div class="cell-num">${dia.getDate()}</div><div class="cell-events">`;
+        visible.forEach(ev=>{html+=`<span class="cell-pill ${ev.eje}" onclick="event.stopPropagation();abrirPopover(event,${ev.id})" title="${ev.titulo}">${ev.inicio?fmtHora(ev.inicio)+' ':''}${ev.titulo}</span>`;});
+        if(extra>0)html+=`<span class="cell-more" onclick="event.stopPropagation();cellClick('${fechaStr}',event)">+${extra} más</span>`;
+        html+=`</div></div>`;
+    });
+    html+=`</div></div>`;
+    document.getElementById('cal-main').innerHTML=html;
+}
+
+// ── Vista Semana ──────────────────────────────────────────
+function renderSemana() {
+    const inicioSem=getInicioSemana(cursor);
+    const dias=Array.from({length:7},(_,i)=>{const d=new Date(inicioSem);d.setDate(inicioSem.getDate()+i);return d;});
+    const fin=new Date(dias[6]);
+    const mismoMes=inicioSem.getMonth()===fin.getMonth();
+    document.getElementById('topbar-label').textContent=mismoMes
+        ?`${inicioSem.getDate()} – ${fin.getDate()} ${MESES[fin.getMonth()]} ${fin.getFullYear()}`
+        :`${inicioSem.getDate()} ${MESES_CORTO[inicioSem.getMonth()]} – ${fin.getDate()} ${MESES_CORTO[fin.getMonth()]} ${fin.getFullYear()}`;
+    const DOW=['LUN','MAR','MIÉ','JUE','VIE','SÁB','DOM'];
+    const allDayHtml=dias.map(dia=>{
+        const f=fmtDate(dia); const evs=eventosFiltrados().filter(e=>e.fecha===f&&!e.inicio);
+        return `<div class="week-allday-cell">${evs.map(ev=>`<span class="cell-pill ${ev.eje}" style="font-size:10px;" onclick="abrirPopover(event,${ev.id})">${ev.titulo}</span>`).join('')}</div>`;
+    }).join('');
+    let html=`<div class="week-view"><div class="week-header-row"><div class="week-header-time"></div>
+    ${dias.map((dia,i)=>{const f=fmtDate(dia);const esHoy=f===fmtDate(hoy);return `<div class="week-header-day${esHoy?' today':''}"><div class="whd-dow">${DOW[i]}</div><div class="whd-num">${dia.getDate()}</div></div>`;}).join('')}
+    </div><div class="week-allday-row"><div class="week-allday-label">todo el día</div>${allDayHtml}</div>
+    <div class="week-body" id="week-body-inner"><div class="week-time-col">
+    ${Array.from({length:24},(_,h)=>`<div class="week-time-slot">${h===0?'':h<12?h+' am':h===12?'12 pm':(h-12)+' pm'}</div>`).join('')}
+    </div>`;
+    dias.forEach((dia,i)=>{
+        const f=fmtDate(dia); const esHoy=f===fmtDate(hoy);
+        const evsDia=eventosFiltrados().filter(e=>e.fecha===f&&e.inicio);
+        html+=`<div class="week-day-col${esHoy?' today':''}" onclick="cellClick('${f}',event)">
+        ${Array.from({length:24},(_,h)=>`<div class="week-hour-row" data-hour="${h}"></div>`).join('')}`;
+        evsDia.forEach(ev=>{
+            const[ih,im]=(ev.inicio||'00:00').split(':').map(Number);
+            let durMin=60;
+            if(ev.fin){const[fh,fm]=ev.fin.split(':').map(Number);durMin=Math.max(30,(fh*60+fm)-(ih*60+im));}
+            else if(ev.horas)durMin=parseFloat(ev.horas)*60;
+            const top=(ih*48)+(im/60*48), height=Math.max(24,durMin/60*48);
+            html+=`<div class="week-event ${ev.eje}" style="top:${top}px;height:${height}px;" onclick="event.stopPropagation();abrirPopover(event,${ev.id})">
+              <div style="font-weight:700;line-height:1.2;">${ev.titulo}</div>
+              ${ev.inicio?`<div style="font-size:10px;opacity:0.8;">${fmtHora(ev.inicio)}${ev.fin?' – '+fmtHora(ev.fin):''}</div>`:''}
+            </div>`;
+        });
+        html+=`</div>`;
+    });
+    html+=`</div></div>`;
+    document.getElementById('cal-main').innerHTML=html;
+    setTimeout(()=>{const wb=document.getElementById('week-body-inner');if(wb)wb.scrollTop=8*48;},50);
+}
+
+// ── Mini calendario ───────────────────────────────────────
+function renderMiniCal() {
+    const year=miniCursor.getFullYear(), month=miniCursor.getMonth();
+    document.getElementById('mini-cal-label').textContent=`${MESES[month].substring(0,3)} ${year}`;
+    const primerDia=new Date(year,month,1); const dow=primerDia.getDay();
+    const inicio=new Date(primerDia); inicio.setDate(primerDia.getDate()-(dow===0?6:dow-1));
+    const DOW=['L','M','X','J','V','S','D'];
+    let html=DOW.map(d=>`<div class="mini-dow">${d}</div>`).join('');
+    const d=new Date(inicio);
+    while(true){
+        const f=fmtDate(d), esHoy=f===fmtDate(hoy), otroMes=d.getMonth()!==month;
+        const hasEv=eventos.some(e=>e.fecha===f);
+        const isSel=(vista==='week')
+            ?(()=>{const s=getInicioSemana(cursor);const e=new Date(s);e.setDate(s.getDate()+6);return d>=s&&d<=e;})()
+            :(d.getMonth()===cursor.getMonth()&&d.getFullYear()===cursor.getFullYear());
+        html+=`<div class="mini-day${otroMes?' other-month':''}${esHoy?' today':''}${isSel&&!esHoy?' selected':''}" onclick="miniClickDia(new Date(${d.getFullYear()},${d.getMonth()},${d.getDate()}))">${d.getDate()}</div>`;
+        d.setDate(d.getDate()+1);
+        if(d.getMonth()!==month&&d.getDay()===1)break;
+        if(d>new Date(year,month+1,14))break;
+    }
+    document.getElementById('mini-grid').innerHTML=html;
+}
+
+// ── Balance ───────────────────────────────────────────────
+function renderBalance() {
+    let fechas=[];
+    const titleEl=document.getElementById('balance-title');
+    if(vista==='month'){
+        const year=cursor.getFullYear(),month=cursor.getMonth();
+        const diasEnMes=new Date(year,month+1,0).getDate();
+        fechas=Array.from({length:diasEnMes},(_,i)=>fmtDate(new Date(year,month,i+1)));
+        if(titleEl)titleEl.textContent='Balance mensual';
+    }else{
+        const inicioSem=getInicioSemana(cursor);
+        fechas=Array.from({length:7},(_,i)=>{const d=new Date(inicioSem);d.setDate(inicioSem.getDate()+i);return fmtDate(d);});
+        if(titleEl)titleEl.textContent='Balance semanal';
+    }
+    const evs=eventosFiltrados().filter(e=>fechas.includes(e.fecha));
+    let total=0; const h={voto:0,comunicacion:0,organizacion:0};
+    evs.forEach(e=>{const v=parseFloat(e.horas)||1;h[e.eje]=(h[e.eje]||0)+v;total+=v;});
+    ['voto','comunicacion','organizacion'].forEach(eje=>{
+        const p=total>0?Math.round(h[eje]/total*100):0;
+        document.getElementById('bpct-'+eje).textContent=p+'%';
+        document.getElementById('bbar-'+eje).style.width=p+'%';
+    });
+    const METAS={voto:40,comunicacion:30,organizacion:30};
+    const ok=total>0&&Object.keys(METAS).every(eje=>Math.abs((total>0?Math.round(h[eje]/total*100):0)-METAS[eje])<=12);
+    const b=document.getElementById('badge-bal');
+    b.className='badge-bal '+(ok?'ok':'bad');
+    b.innerHTML=ok?'<i class="fas fa-check-circle"></i> Balanceado':'<i class="fas fa-triangle-exclamation"></i> Desbalance';
+}
+
+// ── Próximos eventos ──────────────────────────────────────
+function renderUpcoming() {
+    const hoyStr=fmtDate(hoy);
+    const proximos=eventosFiltrados().filter(e=>e.fecha>=hoyStr)
+        .sort((a,b)=>a.fecha.localeCompare(b.fecha)||(a.inicio||'').localeCompare(b.inicio||''))
+        .slice(0,5);
+    const ul=document.getElementById('upcoming-list');
+    if(!proximos.length){ul.innerHTML='<div style="font-size:12px;color:var(--text-light);padding:8px 0;">Sin eventos próximos</div>';return;}
+    ul.innerHTML=proximos.map(ev=>{
+        const c=EJE_COLORS[ev.eje]||'#666';
+        const fechaD=new Date(ev.fecha+'T12:00:00');
+        const label=ev.fecha===hoyStr?'Hoy':`${fechaD.getDate()} ${MESES_CORTO[fechaD.getMonth()]}`;
+        return `<div class="upcoming-item" onclick="abrirPopoverById(${ev.id})">
+          <div class="upcoming-dot" style="background:${c};"></div>
+          <div><div class="upcoming-ev-title">${ev.titulo}</div>
+          <div class="upcoming-ev-date">${label}${ev.inicio?' · '+fmtHora(ev.inicio):''}</div></div></div>`;
+    }).join('');
+}
+
+// ── Navegación ────────────────────────────────────────────
+function navegar(dir){
+    if(vista==='month'){cursor.setMonth(cursor.getMonth()+dir);miniCursor=new Date(cursor);}
+    else{cursor.setDate(cursor.getDate()+dir*7);miniCursor=new Date(cursor);}
+    render();
+}
+function irHoy(){cursor=new Date(hoy);miniCursor=new Date(hoy);render();}
+function setVista(v){
+    vista=v;
+    document.getElementById('vbtn-month').className='view-btn'+(v==='month'?' active':'');
+    document.getElementById('vbtn-week').className='view-btn'+(v==='week'?' active':'');
+    render();
+}
+function miniNavegar(dir){miniCursor.setMonth(miniCursor.getMonth()+dir);renderMiniCal();}
+function miniClickDia(d){cursor=new Date(d);render();}
+function cellClick(fechaStr,e){
+    if(e.target.closest('.cell-pill,.week-event,.cell-more'))return;
+    abrirModal(null,fechaStr);
+}
+
+// ── Popover ───────────────────────────────────────────────
+function abrirPopover(e,id){
+    e.stopPropagation(); cerrarPopover();
+    const ev=eventos.find(x=>x.id===id); if(!ev)return;
+    popoverEvId=id;
+    const c=EJE_COLORS[ev.eje]||'#666';
+    document.getElementById('pop-bar').style.background=c;
+    document.getElementById('pop-title').textContent=ev.titulo;
+    const b=document.getElementById('pop-badge');
+    b.textContent=EJE_LABELS[ev.eje]||ev.eje;
+    b.style.cssText=`background:${c}18;color:${c};border:1px solid ${c}40;`;
+    const setRow=(id,val)=>{const row=document.getElementById(id);row.style.display=val?'flex':'none';if(val)row.querySelector('span').textContent=val;};
+    const fechaD=new Date(ev.fecha+'T12:00:00');
+    setRow('pop-fecha',`${fechaD.getDate()} de ${MESES[fechaD.getMonth()]} ${fechaD.getFullYear()}`);
+    setRow('pop-hora',(ev.inicio||ev.fin)?`${fmtHora(ev.inicio)}${ev.fin?' – '+fmtHora(ev.fin):''}`:null);
+    setRow('pop-lugar',[ev.estado,ev.region||null,ev.municipio,ev.seccion?'Sec.'+ev.seccion:null].filter(Boolean).join(', ')||null);
+    setRow('pop-resp',ev.responsable||null);
+    setRow('pop-notas',ev.notas||null);
+    const esPasado=ev.fecha<fmtDate(hoy);
+    const popDel=document.getElementById('pop-del');
+    popDel.disabled=esPasado; popDel.style.opacity=esPasado?'0.4':''; popDel.style.cursor=esPasado?'not-allowed':'';
+    popDel.onclick=esPasado?null:()=>eliminarEvento(id);
+    document.getElementById('pop-edit').onclick=()=>{cerrarPopover();abrirModal(id);};
+    const pop=document.getElementById('ev-popover');
+    pop.style.display='block';
+    const rect=e.currentTarget?.getBoundingClientRect?e.currentTarget.getBoundingClientRect():{left:e.clientX,top:e.clientY,width:0};
+    let left=rect.left+rect.width+8, top=rect.top;
+    if(left+320>window.innerWidth)left=rect.left-320-8;
+    if(top+350>window.innerHeight)top=window.innerHeight-360;
+    pop.style.left=Math.max(8,left)+'px'; pop.style.top=Math.max(8,top)+'px';
+}
+function abrirPopoverById(id){
+    const fakeE={stopPropagation:()=>{},clientX:window.innerWidth/2,clientY:200,currentTarget:{getBoundingClientRect:()=>({left:window.innerWidth/2-150,top:200,width:0})}};
+    abrirPopover(fakeE,id);
+}
+function cerrarPopover(){document.getElementById('ev-popover').style.display='none';popoverEvId=null;}
+document.addEventListener('click',e=>{
+    const pop=document.getElementById('ev-popover');
+    if(pop.style.display!=='none'&&!pop.contains(e.target))cerrarPopover();
+});
+
+// ── Horas select ─────────────────────────────────────────
+function poblarSelectHoras(selId,valorActual=''){
+    const sel=document.getElementById(selId); if(!sel)return;
+    const normalizar=v=>(v||'').trim().substring(0,5);
+    const cur=normalizar(valorActual);
+    sel.innerHTML='<option value="">-- : --</option>';
+    for(let h=0;h<24;h++){for(let m of[0,30]){
+        const hh=String(h).padStart(2,'0'),mm=String(m).padStart(2,'0'),val=`${hh}:${mm}`;
+        const ampm=h<12?'am':'pm',h12=h%12||12,label=`${h12}:${mm} ${ampm}`;
+        const o=document.createElement('option');o.value=val;o.textContent=label;
+        if(val===cur)o.selected=true;sel.appendChild(o);
+    }}
+}
+function limpiarErrorFin(){
+    const finEl=document.getElementById('f-fin');
+    finEl.style.borderColor='';finEl.style.background='';finEl.title='';
+    const errMsg=document.getElementById('hora-error-msg');if(errMsg)errMsg.style.display='none';
+}
+function calcHoras(){
+    const ini=document.getElementById('f-inicio').value,fin=document.getElementById('f-fin').value;
+    if(ini&&fin){
+        const[hi,mi]=ini.split(':').map(Number),[hf,mf]=fin.split(':').map(Number);
+        const d=(hf*60+mf-hi*60-mi)/60;
+        if(d<=0)document.getElementById('f-fin').style.borderColor='#dc2626';
+        else limpiarErrorFin();
+    }
+}
+
+// ── Modal ─────────────────────────────────────────────────
+function abrirModal(id=null, fechaPre=null){
+    cerrarPopover(); editandoId=id; ejeSeleccionado=null;
+    document.getElementById('modal-title').textContent=id?'Editar Evento':'Nuevo Evento';
+    const btnDel=document.getElementById('btn-del-ev');
+    ['f-titulo','f-responsable','f-notas'].forEach(x=>document.getElementById(x).value='');
+    document.querySelectorAll('.eje-pill').forEach(b=>b.className='eje-pill');
+    document.getElementById('f-subtipo').innerHTML='<option value="">— Selecciona un eje primero —</option>';
+    secAgendaReset('Selecciona municipio primero');
+
+    // Reset geo — solo para niveles donde el usuario puede elegir
+    if(MI_NIVEL<=2){
+        document.getElementById('f-estado').value='';
+        const selR=document.getElementById('f-region');if(selR){selR.innerHTML='<option value="">— Región —</option>';selR.disabled=true;}
+    }
+    const selM=document.getElementById('f-municipio');
+    if(selM&&MI_NIVEL<=3){selM.innerHTML='<option value="">— Municipio —</option>';if(MI_NIVEL<=2)selM.disabled=true;}
+
+    if(id){
+        const ev=eventos.find(e=>e.id===id);if(!ev)return;
+        selEje(ev.eje);
+        setTimeout(()=>{document.getElementById('f-subtipo').value=ev.subtipo||'';},50);
+        ['titulo','fecha','responsable','notas'].forEach(k=>{const el=document.getElementById('f-'+k);if(el)el.value=ev[k]||'';});
+        poblarSelectHoras('f-inicio',ev.inicio||'');
+        poblarSelectHoras('f-fin',ev.fin||'');
+        // Restaurar geo
+        if(ev.estado&&MI_NIVEL<=2){
+            const fEst=document.getElementById('f-estado');
+            if(fEst){fEst.value=ev.estado;cargarRegionesModal(ev.estado);}
+        }
+        setTimeout(()=>{
+            const selR=document.getElementById('f-region');
+            if(selR&&ev.region){
+                for(let o of selR.options){if(o.textContent===ev.region||o.value===ev.region){selR.value=o.value;cargarMunicipiosDesdeRegion(o.value);break;}}
+            }
+            setTimeout(()=>{
+                if(ev.municipio){
+                    const selM2=document.getElementById('f-municipio');
+                    if(selM2)selM2.value=ev.municipio;
+                    cargarSecciones(ev.municipio,()=>{
+                        if(ev.seccion){document.getElementById('f-seccion').value=ev.seccion;document.getElementById('sec-agenda-display').value=ev.seccion;}
+                    });
+                }
+            },80);
+        },80);
+        const esPasado=ev.fecha<fmtDate(hoy);
+        btnDel.style.visibility='visible'; btnDel.disabled=esPasado;
+        btnDel.style.opacity=esPasado?'0.4':''; btnDel.style.cursor=esPasado?'not-allowed':'';
+        btnDel.onclick=esPasado?null:()=>eliminarEvento(id);
+    }else{
+        document.getElementById('f-fecha').value=fechaPre||fmtDate(hoy);
+        poblarSelectHoras('f-inicio',''); poblarSelectHoras('f-fin','');
+        btnDel.style.visibility='hidden';
+    }
+    document.getElementById('modal-form').classList.add('open');
+}
+function cerrarModal(){document.getElementById('modal-form').classList.remove('open');}
+
+function selEje(eje){
+    ejeSeleccionado=eje;
+    document.querySelectorAll('.eje-pill').forEach(b=>b.className='eje-pill'+(b.dataset.eje===eje?' sel-'+eje:''));
+    const sel=document.getElementById('f-subtipo');
+    sel.innerHTML='<option value="">Selecciona subtipo…</option>';
+    (SUBTIPOS[eje]||[]).forEach(s=>{const o=document.createElement('option');o.value=s;o.textContent=s;sel.appendChild(o);});
+}
+
+async function guardarEvento(){
+    const titulo=document.getElementById('f-titulo').value.trim();
+    const fecha=document.getElementById('f-fecha').value;
+    const btn=document.getElementById('btn-save-ev');
+    if(!titulo){document.getElementById('f-titulo').focus();return;}
+    if(!fecha||!ejeSeleccionado)return;
+    let horas=0;
+    const ini=document.getElementById('f-inicio').value,fin=document.getElementById('f-fin').value;
+    if(ini&&fin){
+        const[hi,mi]=ini.split(':').map(Number),[hf,mf]=fin.split(':').map(Number);
+        if(hf*60+mf<=hi*60+mi){
+            document.getElementById('f-fin').style.borderColor='#dc2626';
+            const errMsg=document.getElementById('hora-error-msg');if(errMsg){errMsg.style.display='block';setTimeout(()=>errMsg.style.display='none',3500);}
+            return;
+        }
+        horas=Math.max(0,(hf*60+mf-hi*60-mi)/60);
+    }
+    if(!horas)horas=1;
+    const fd=new FormData();
+    fd.append('action',editandoId?'update':'create');
+    if(editandoId)fd.append('id',editandoId);
+    ['eje','subtipo','titulo','fecha','estado','municipio','responsable','notas'].forEach(k=>{
+        const el=document.getElementById('f-'+k)||{value:''};
+        fd.append(k,k==='eje'?ejeSeleccionado:(el.value||''));
+    });
+    // Región: enviar nombre (no id)
+    const selR=document.getElementById('f-region');
+    fd.append('region',selR&&selR.value?(selR.options[selR.selectedIndex]?.textContent||''):'');
+    fd.append('seccion',document.getElementById('f-seccion').value||'');
+    fd.append('inicio',document.getElementById('f-inicio').value||'');
+    fd.append('fin',document.getElementById('f-fin').value||'');
+    fd.append('horas',horas);
+    btn.disabled=true;btn.innerHTML='<i class="fas fa-spinner fa-spin"></i> Guardando…';
+    try{
+        const res=await fetch(PROCESAR_URL,{method:'POST',body:fd});
+        const data=await res.json();
+        if(!data.ok)throw new Error(data.msg||'Error');
+        await cargarEventos(); cerrarModal(); render();
+    }catch(e){alert('Error: '+e.message);}
+    finally{btn.disabled=false;btn.innerHTML='<i class="fas fa-check"></i> Guardar';}
+}
+
+async function eliminarEvento(id){
+    const ev=eventos.find(e=>e.id===id);
+    if(ev&&ev.fecha<fmtDate(hoy)){alert('No se pueden eliminar eventos pasados.');return;}
+    if(!confirm('¿Eliminar este evento?'))return;
+    const fd=new FormData();fd.append('action','delete');fd.append('id',id);
+    try{
+        const res=await fetch(PROCESAR_URL,{method:'POST',body:fd});
+        const data=await res.json();
+        if(!data.ok)throw new Error(data.msg);
+        cerrarModal();cerrarPopover();await cargarEventos();render();
+    }catch(e){alert('Error: '+e.message);}
+}
+
+// ── GEO: estados, regiones, municipios, secciones ────────
+function cargarRegionesModal(estado){
+    const selR=document.getElementById('f-region');
+    const selM=document.getElementById('f-municipio');
+    if(selR){selR.innerHTML='<option value="">— Región —</option>';selR.disabled=true;}
+    if(selM){selM.innerHTML='<option value="">— Municipio —</option>';selM.disabled=true;}
+    secAgendaReset('Selecciona municipio primero');
+    if(!estado)return;
+    const regiones=REGIONES_DATA[estado]||[];
+    if(regiones.length>0&&selR){
+        regiones.forEach(r=>{const o=document.createElement('option');o.value=r.id;o.textContent=r.nombre;selR.appendChild(o);});
+        selR.disabled=false;
+    }else{
+        // Sin regiones: cargar municipios directamente por estado
+        cargarMunicipiosEstado(estado);
+    }
+}
+
+function cargarMunicipiosEstado(estado){
+    const selM=document.getElementById('f-municipio');if(!selM)return;
+    const entry=Object.values(GEO_DATA).find(e=>normalize(e.label)===normalize(estado));
+    const lista=entry?[...entry.municipios].sort():[];
+    selM.innerHTML='<option value="">— Municipio —</option>';
+    lista.forEach(m=>{const o=document.createElement('option');o.value=m;o.textContent=m;selM.appendChild(o);});
+    selM.disabled=lista.length===0;
+}
+
+function cargarMunicipiosDesdeRegion(regionId){
+    // Para niveles 1-2: cargar municipios del estado
+    const estadoLabel=document.getElementById('f-estado')?.value||USER_ESTADO||'';
+    cargarMunicipiosEstado(estadoLabel);
+    secAgendaReset('Selecciona municipio primero');
+}
+
+function cargarSecciones(municipio,cb){
+    secAgendaReset('Cargando secciones…',true);
+    if(!municipio){secAgendaReset('Selecciona municipio primero');if(cb)cb();return;}
+    // SECCIONES_GEO puede ser {estado:{municipio:[sec]}} (niveles 1-3) o {municipio:[sec]} (niveles 4-5)
+    let secciones=[];
+    const estadoLabel=document.getElementById('f-estado')?.value||USER_ESTADO||'';
+    if(MI_NIVEL<=3){
+        secciones=(SECCIONES_GEO[estadoLabel]||{})[municipio]||[];
+    }else{
+        secciones=SECCIONES_GEO[municipio]||[];
+    }
+    SEC_AGENDA=secciones;
+    secAgendaActualizarContador(SEC_AGENDA.length);
+    secAgendaRenderOpts(SEC_AGENDA);
+    document.getElementById('sec-agenda-display').placeholder=SEC_AGENDA.length?`— Selecciona sección (${SEC_AGENDA.length}) —`:'— Sin secciones —';
+    if(cb)cb();
+}
+
+// ── Buscador de sección ───────────────────────────────────
+function secAgendaReset(msg='Selecciona municipio primero',loading=false){
+    SEC_AGENDA=[];SEC_FOCUSED=-1;
+    document.getElementById('f-seccion').value='';
+    document.getElementById('sec-agenda-display').value='';
+    document.getElementById('sec-agenda-display').placeholder='— '+msg+' —';
+    document.getElementById('sec-agenda-search').value='';
+    secAgendaActualizarContador(0);
+    const opts=document.getElementById('sec-agenda-options');
+    opts.innerHTML=loading?`<div class="sec-agenda-loading"><i class="fas fa-spinner fa-spin"></i> ${msg}</div>`:`<div class="sec-agenda-empty">${msg}</div>`;
+    secAgendaCerrar();
+}
+function secAgendaActualizarContador(n){const el=document.getElementById('f-sec-contador');if(el)el.textContent=n>0?`(${n} secciones)`:'';}
+function secAgendaRenderOpts(lista,busqueda=''){
+    const opts=document.getElementById('sec-agenda-options');
+    const actual=document.getElementById('f-seccion').value;SEC_FOCUSED=-1;
+    if(!lista.length){opts.innerHTML=`<div class="sec-agenda-empty">Sin resultados${busqueda?` para "${busqueda}"`:''}</div>`;return;}
+    opts.innerHTML=lista.map(s=>{const label=busqueda.trim()?s.replace(new RegExp(`(${busqueda.trim()})`,'gi'),'<em>$1</em>'):s;return `<div class="sec-agenda-opt${String(s)===String(actual)?' selected':''}" onmousedown="secAgendaSeleccionar('${s}')">${label}</div>`;}).join('');
+}
+function secAgendaFiltrar(q){if(!SEC_AGENDA.length)return;const f=q.trim()?SEC_AGENDA.filter(s=>s.toString().toLowerCase().includes(q.trim().toLowerCase())):SEC_AGENDA;secAgendaRenderOpts(f,q);}
+function secAgendaSeleccionar(val){document.getElementById('f-seccion').value=val;document.getElementById('sec-agenda-display').value=val;document.getElementById('sec-agenda-display').placeholder='';secAgendaCerrar();document.querySelectorAll('.sec-agenda-opt').forEach(el=>el.classList.toggle('selected',el.textContent===val));}
+function secAgendaToggle(){const wrap=document.getElementById('sec-agenda-wrap');if(!SEC_AGENDA.length)return;if(wrap.classList.contains('open')){secAgendaCerrar();}else{wrap.classList.add('open');const s=document.getElementById('sec-agenda-search');s.value='';secAgendaRenderOpts(SEC_AGENDA);setTimeout(()=>s.focus(),50);}}
+function secAgendaCerrar(){document.getElementById('sec-agenda-wrap')?.classList.remove('open');}
+function secAgendaNavegar(e){const items=document.querySelectorAll('.sec-agenda-opt');if(!items.length)return;if(e.key==='ArrowDown')SEC_FOCUSED=Math.min(SEC_FOCUSED+1,items.length-1);else if(e.key==='ArrowUp')SEC_FOCUSED=Math.max(SEC_FOCUSED-1,0);else if(e.key==='Enter'&&SEC_FOCUSED>=0){e.preventDefault();secAgendaSeleccionar(items[SEC_FOCUSED].textContent);return;}else if(e.key==='Escape'){secAgendaCerrar();return;}items.forEach((el,i)=>el.classList.toggle('focused',i===SEC_FOCUSED));if(SEC_FOCUSED>=0)items[SEC_FOCUSED].scrollIntoView({block:'nearest'});}
+document.addEventListener('click',e=>{if(!e.target.closest('#sec-agenda-wrap'))secAgendaCerrar();});
+
+// ── FILTROS ───────────────────────────────────────────────
+function toggleEjeFilter(eje){
+    const idx=filtros.ejes.indexOf(eje);
+    if(idx>=0)filtros.ejes.splice(idx,1);else filtros.ejes.push(eje);
+    ['voto','comunicacion','organizacion'].forEach(e=>{
+        const btn=document.getElementById('fchip-'+e);
+        if(btn)btn.className='filter-chip'+(filtros.ejes.includes(e)?' active-'+e:'');
+    });
+    actualizarBtnReset(); render();
+}
+
+function onFilterEstadoChange(){
+    const estado=document.getElementById('f-filter-estado')?.value||'';
+    filtros.estado=estado; filtros.region=''; filtros.zona=''; filtros.seccion='';
+    // Poblar regiones
+    const selR=document.getElementById('f-filter-region');
+    if(selR){
+        selR.innerHTML='<option value="">Todas las regiones</option>';selR.disabled=true;
+        const regiones=REGIONES_DATA[estado]||[];
+        if(regiones.length>0){regiones.forEach(r=>{const o=document.createElement('option');o.value=r.nombre;o.textContent=r.nombre;selR.appendChild(o);});selR.disabled=false;}
+    }
+    const selZ=document.getElementById('f-filter-zona');if(selZ)selZ.innerHTML='<option value="">Todas las zonas</option>';
+    actualizarSelectClase('f-filter-estado',!!estado);actualizarBtnReset();render();
+}
+
+function onFilterRegionChange(){
+    const region=document.getElementById('f-filter-region')?.value||'';
+    filtros.region=region; filtros.zona=''; filtros.seccion='';
+    // Para niveles 1-2: cargar municipios como "zona"
+    const selZ=document.getElementById('f-filter-zona');
+    if(selZ&&MI_NIVEL<=2){
+        selZ.innerHTML='<option value="">Todas las zonas</option>';
+        if(region){
+            const estadoLabel=document.getElementById('f-filter-estado')?.value||'';
+            const entry=Object.values(GEO_DATA).find(e=>normalize(e.label)===normalize(estadoLabel));
+            const lista=entry?[...entry.municipios].sort():[];
+            lista.forEach(m=>{const o=document.createElement('option');o.value=m;o.textContent=m;selZ.appendChild(o);});
+        }
+    } else if(selZ&&MI_NIVEL===3){
+        // Nivel 3: municipios del estado filtrados
+        selZ.innerHTML='<option value="">Todos los municipios</option>';
+        if(region){
+            const entry=Object.values(GEO_DATA)[0];
+            const lista=entry?[...entry.municipios].sort():[];
+            lista.forEach(m=>{const o=document.createElement('option');o.value=m;o.textContent=m;selZ.appendChild(o);});
+        }
+    }
+    actualizarSelectClase('f-filter-region',!!region);actualizarBtnReset();render();
+}
+
+function onFilterZonaChange(){
+    const zona=document.getElementById('f-filter-zona')?.value||'';
+    filtros.zona=zona;filtros.seccion='';
+    // Para nivel <=2: zona es realmente municipio → cargar secciones
+    if(MI_NIVEL<=2){
+        filtros.municipio=zona;filtros.zona='';
+        const selSec=document.getElementById('f-filter-seccion');
+        if(selSec){
+            selSec.innerHTML='<option value="">Todas las secciones</option>';
+            if(zona){
+                const estadoLabel=document.getElementById('f-filter-estado')?.value||'';
+                const lista=(SECCIONES_GEO[estadoLabel]||{})[zona]||[];
+                lista.forEach(s=>{const o=document.createElement('option');o.value=s;o.textContent=s;selSec.appendChild(o);});
+            }
+        }
+    } else {
+        // Nivel 4-5: filtrar por zona
+        filtros.municipio='';
+    }
+    actualizarSelectClase('f-filter-zona',!!zona);actualizarBtnReset();render();
+}
+
+function onFilterMunicipioChange(){
+    const mun=document.getElementById('f-filter-municipio')?.value||'';
+    filtros.municipio=mun;filtros.seccion='';
+    actualizarSelectClase('f-filter-municipio',!!mun);actualizarBtnReset();render();
+}
+
+function actualizarSelectClase(id,active){const el=document.getElementById(id);if(el){if(active)el.classList.add('active');else el.classList.remove('active');}}
+
+function resetFiltros(){
+    filtros={ejes:[],estado:'',region:'',zona:'',municipio:'',seccion:''};
+    ['f-filter-estado','f-filter-region','f-filter-zona','f-filter-municipio','f-filter-seccion'].forEach(id=>{const el=document.getElementById(id);if(el){el.value='';el.classList.remove('active');}});
+    const selR=document.getElementById('f-filter-region');if(selR){selR.innerHTML='<option value="">Todas las regiones</option>';selR.disabled=true;}
+    ['voto','comunicacion','organizacion'].forEach(e=>{const btn=document.getElementById('fchip-'+e);if(btn)btn.className='filter-chip';});
+    actualizarBtnReset();render();
+}
+
+function actualizarBtnReset(){
+    const activo=filtros.ejes.length>0||filtros.estado||filtros.region||filtros.zona||filtros.municipio||filtros.seccion;
+    document.getElementById('btn-reset-filters').style.display=activo?'flex':'none';
+    const cnt=document.getElementById('filter-count');
+    if(activo){cnt.style.display='inline-flex';cnt.textContent=eventosFiltrados().length+' de '+eventos.length+' eventos';}
+    else cnt.style.display='none';
+    // Conectar select de sección
+    const selSec=document.getElementById('f-filter-seccion');
+    if(selSec)selSec.onchange=()=>{filtros.seccion=selSec.value;actualizarSelectClase('f-filter-seccion',!!filtros.seccion);actualizarBtnReset();render();};
+}
+
+// ── Init ──────────────────────────────────────────────────
+(async()=>{await cargarEventos();actualizarBtnReset();render();})();
+</script>
+</body>
+</html>

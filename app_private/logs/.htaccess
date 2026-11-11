@@ -1,0 +1,3 @@
+# Proteger logs
+Order allow,deny
+Deny from all

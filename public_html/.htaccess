@@ -1,0 +1,15 @@
+RewriteEngine On
+RewriteBase /
+
+<FilesMatch "^(db\.php|config\.php|\.env|bootstrap\.php|composer\.json|composer\.lock)$">
+    Order allow,deny
+    Deny from all
+</FilesMatch>
+
+RewriteRule ^App/ - [L]
+
+
+RewriteRule ^registro\.php$ /registro.php [L]
+
+
+Options -Indexes

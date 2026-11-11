@@ -1,0 +1,3 @@
+# Denegar todo el acceso a esta carpeta
+Order allow,deny
+Deny from all
