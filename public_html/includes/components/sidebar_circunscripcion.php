@@ -54,6 +54,8 @@
                 </ul>
             </li>
 
+            <?php include __DIR__ . '/menu_representantes.php'; ?>
+
             <li class="menu-item">
                 <a href="/App/circunscripcion/agenda.php" class="menu-link">
                     <span class="menu-icon"><i class="fas fa-calendar-alt"></i></span>
