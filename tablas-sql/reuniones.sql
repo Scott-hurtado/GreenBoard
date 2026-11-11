@@ -40,13 +40,6 @@ CREATE TABLE `reuniones` (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 --
--- Volcado de datos para la tabla `reuniones`
---
-
-INSERT INTO `reuniones` (`id`, `titulo`, `fecha`, `asistentes`, `temas`, `descripcion`, `acuerdos`, `creado_por`, `fecha_creacion`) VALUES
-(4, 'Primera Reunión de Planeación', '2026-01-05', 'Luis R. José B, Luisa R.', 'Puntos de partida y Análisis de Investigación', 'Objetivo: Iniciar formalmente la organización rumbo a 2027.\nPuntos clave tratados:\nSe acuerda que la elección se empieza a trabajar desde ahora, no en campaña.\nEl partido necesita reorganizarse y dejar la simulación.\nLa estructura debe ser real, territorial y medible, no solo en papel.\nSe exigirá disciplina, orden y resultados a todos los dirigentes.\nEl PVEM debe recuperar su identidad y liderazgo en el tema ambiental.\nSe establecen metas claras: crecer en votación, ser tercera fuerza y superar históricos.\nHabrá seguimiento semanal, reportes y medición por resultados.\nConclusión:\nEl partido entra en una etapa de organización total, exigencia y enfoque en resultados.\n', '[\"Llenar el Formato de Gestión\",\"Investigación de Mercado\"]', 'M. Acosta', '2026-01-13 05:55:28');
-
---
 -- Índices para tablas volcadas
 --
 

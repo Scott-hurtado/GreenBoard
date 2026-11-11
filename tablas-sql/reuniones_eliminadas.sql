@@ -41,17 +41,6 @@ CREATE TABLE `reuniones_eliminadas` (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 --
--- Volcado de datos para la tabla `reuniones_eliminadas`
---
-
-INSERT INTO `reuniones_eliminadas` (`id`, `titulo`, `fecha`, `asistentes`, `temas`, `descripcion`, `acuerdos`, `creado_por`, `fecha_creacion`, `fecha_eliminacion`) VALUES
-(1, 'Reunión de prueba', '2026-01-05', 'Persona de Prueba', 'Prueba', 'test', '[\"Llegar a tiempo\",\"Participar activamente\"]', 'M. Acosta', '2026-01-05 20:13:20', '2026-01-08 18:42:20'),
-(2, 'Avance vizion', '2026-01-03', 'Juan, Omar', 'agenda', '<p><br></p>', '[]', 'M. Acosta', '2026-01-06 01:55:16', '2026-01-08 21:32:35'),
-(3, 'sdasdasdasdasdasdasdasdasd', '2026-01-09', 'daniel,scott', 'vamos a ver  el tema tal de la tal  para tal', 'sdsdsdsdsdddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\n', '[\"se va ser tal cosa\",\"vamos hacer tal tambein\"]', 'M. Acosta', '2026-01-09 21:27:27', '2026-01-11 05:02:19'),
-(5, 'asdljch asklñdjc naskñldjc as alskñdmcn aslñdkjc asdlñkc asdñlkcn dcñkdn cñqskdc sdñkc asdñkcmas clñkasnmd claksdn claksdn calsdknc alsdknc asldmnc asdlkcn asdljcn', '2026-01-13', 'asdasdadasdcasdvsdfvdfvdfvwfvwevewrverveveverfercqercqecqfc asdasdadasdcasdvsdfvdfvdfvwfvwevewrverveveverfercqercqecqfc. asdasdadasdcasdvsdfvdfvdfvwfvwevewrverveveverfercqercqecqfc asdasdadasdcasdvsdfvdfvdfvwfvwevewrverveveverfercqercqecqfc', 'aasdasdasdasdd dasdasdadasdcasdvsdfvdfvdfvwfvwevewrverveveverfercqercqecqfc asdasdadasdcasdvsdfvdfvdfvwfvwevewrverveveverfercqercqecqfc. asdasdadasdcasdvsdfvdfvdfvwfvwevewrverveveverfercqercqecqfc asdasdadasdcasdvsdfvdfvdfvwfvwevewrverveveverfercqercqecqfc', 'sdfasdfasdfasdvasdfasdvadvasdc\n', '[\"sdfadfwqedqwedqwedq\"]', 'M. Acosta', '2026-01-16 19:53:50', '2026-01-17 22:42:46'),
-(6, 'sdsd sds ds ds d sd sd s ds ds d sd sd s dsd s ds ds d sd s ', '2026-01-08', 'sdsdsd sd s ds d sd s ds d s d sd s d s ds d s d sd s d sd s d s ds d s d sd s d s d sd s d s d sd s', 'sd s d sd s d sd s d sd s d s ds. djdnfkjdnfdkjfndakjfndakjfnadkjfndakjfnadkjfna', '<p>lkadnfkjdnfkadjnfsakjnfaskjfnadkjfnadkjfnadkjfnakdjfndakjfnakdjfnkajdfnkjadnfkjadnfkjadnfkjadnfkjanfkjadnfkjadnfkjadnfkjadnfkjadnfkjadnfkjadnfkjadnfkjandfkjadnfkjandfkjandkfjnadkjnakjnfkjadfnkjadnfkjadnfkjasnfkjasnfkjadnfkjandfjknadskjfnaskjfnkjasnfkjanfkjasnfkjasnfkjanf kad fkd lkadnfkjdnfkadjnfsakjnfaskjfnadkjfnadkjfnadkjfnakdjfndakjfnakdjfnkajdfnkjadnfkjadnfkjadnfkjadnfkjanfkjadnfkjadnfkjadnfkjadnfkjadnfkjadnfkjadnfkjadnfkjandfkjadnfkjandfkjandkfjnadkjnakjnfkjadfnkjadnfkjadnfkjasnfkjasnfkj</p>', '[\"ksdmf\"]', 'M. Acosta', '2026-01-19 17:33:18', '2026-01-26 23:53:15');
-
---
 -- Índices para tablas volcadas
 --
 

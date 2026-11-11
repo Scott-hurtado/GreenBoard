@@ -39,19 +39,6 @@ CREATE TABLE `tareas_estatales` (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 --
--- Volcado de datos para la tabla `tareas_estatales`
---
-
-INSERT INTO `tareas_estatales` (`id`, `estado`, `id_actividad_banco`, `mes_objetivo`, `impacto_estimado`, `comentarios`, `estatus`, `fecha_asignacion`) VALUES
-(1, 'Sonora', '1', 'Marzo', '300', 'test', 'pendiente', '2025-12-15 20:06:13'),
-(2, 'Sonora', '2', 'Marzo', '50', 'test', 'pendiente', '2025-12-15 20:07:17'),
-(3, 'Sonora', '3', 'Enero', '50', 'test', 'pendiente', '2025-12-15 20:10:27'),
-(4, 'Sonora', '2', 'Octubre', '100', 'test', 'pendiente', '2025-12-15 20:10:57'),
-(5, 'Sonora', '1', 'Mayo', '50', 'Esto es una prueba', 'pendiente', '2025-12-15 20:16:25'),
-(6, 'Sonora', '3', 'Noviembre', '300', 'prueba', 'pendiente', '2025-12-15 20:24:13'),
-(7, 'Sonora', '2', 'Marzo', '200', 'kjhb', 'pendiente', '2025-12-15 20:43:58');
-
---
 -- Índices para tablas volcadas
 --
 
